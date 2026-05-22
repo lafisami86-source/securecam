@@ -7,18 +7,19 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
-// Try both approaches for maximum Railway compatibility
-let wss;
-try {
-  wss = new WebSocket.Server({ server });
-  console.log('[WS] Using attached server mode');
-} catch(e) {
-  wss = new WebSocket.Server({ noServer: true });
-  server.on('upgrade', (req, socket, head) => {
+// ── WebSocket Server on /ws path ────────────────────────────
+// Using noServer + manual upgrade for Railway/proxy compatibility
+const wss = new WebSocket.Server({ noServer: true, path: '/ws' });
+
+server.on('upgrade', (req, socket, head) => {
+  // Accept upgrades on /ws path OR root path (for backward compat)
+  const urlPath = new URL(req.url, `http://${req.headers.host}`).pathname;
+  if (urlPath === '/ws' || urlPath === '/') {
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-  });
-  console.log('[WS] Using noServer mode');
-}
+  } else {
+    socket.destroy();
+  }
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
@@ -37,7 +38,6 @@ function send(ws, obj) {
 }
 
 function sendToClient(clientId, obj) {
-  // Try WebSocket first
   const q = pollQueues.get(clientId);
   if (q) {
     q.push(obj);
@@ -60,9 +60,7 @@ function getOrCreateRoom(code) {
 }
 
 function broadcastToViewers(room, obj) {
-  // WS viewers
   room.viewers.forEach(id => sendToClient(id, obj));
-  // Legacy WS
   if (room.wsViewers) room.wsViewers.forEach(ws => send(ws, obj));
 }
 
@@ -163,10 +161,15 @@ function handleMessage(msg, clientId, wsClient) {
   }
 }
 
-// ── WebSocket (if supported) ───────────────────────────────
+// ── WebSocket connections ──────────────────────────────────
 wss.on('connection', (ws, req) => {
-  console.log('[WS] Client connected');
+  console.log('[WS] Client connected from', req.headers['x-forwarded-for'] || req.socket.remoteAddress);
   send(ws, { type: 'connected' });
+
+  // Heartbeat: track alive state
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', raw => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     handleMessage(msg, null, ws);
@@ -176,12 +179,24 @@ wss.on('connection', (ws, req) => {
     if (!meta) return;
     const r = rooms.get(meta.roomCode);
     if (!r) return;
-    if (meta.role === 'camera') { r.wsCamera = null; if (r.wsViewers) r.wsViewers.forEach(v => send(v, { type: 'camera-disconnected' })); broadcastToViewers(r, { type: 'camera-disconnected' }); }
-    else if (r.wsViewers) r.wsViewers.delete(ws);
+    if (meta.role === 'camera') {
+      r.wsCamera = null;
+      if (r.wsViewers) r.wsViewers.forEach(v => send(v, { type: 'camera-disconnected' }));
+      broadcastToViewers(r, { type: 'camera-disconnected' });
+    } else if (r.wsViewers) {
+      r.wsViewers.delete(ws);
+    }
   });
 });
 
-setInterval(() => { wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.ping(); }); }, 20000);
+// Heartbeat: check dead connections every 30s
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
 
 // ── HTTP Polling Fallback ──────────────────────────────────
 app.post('/api/poll/register', (req, res) => {

@@ -1,6 +1,9 @@
 'use strict';
 
-// ── Transport Layer (WebSocket with HTTP polling fallback) ──
+// ── Transport Layer (HTTP polling primary, WebSocket optional upgrade) ──
+// Railway and many cloud hosts don't support WebSocket over their proxy.
+// Polling is reliable everywhere, so we use it as the PRIMARY transport,
+// and optionally upgrade to WebSocket in the background if available.
 class SignalingClient extends EventTarget {
   constructor() {
     super();
@@ -15,150 +18,97 @@ class SignalingClient extends EventTarget {
     this._reconnectAttempts = 0;
     this._queue = [];
     this._heartbeatInterval = null;
+    this._wsUpgradeDone = false;
   }
 
   connect() {
     this._intentionalClose = false;
     this._reconnectAttempts = 0;
-    this._tryWebSocket();
+    // Start with polling immediately (works on Railway, Render, etc.)
+    this._startPolling();
+    // Try WebSocket upgrade in background (faster if supported)
+    this._tryWebSocketUpgrade();
   }
 
-  _tryWebSocket() {
+  // ── WebSocket Upgrade (background, non-blocking) ───────
+  _tryWebSocketUpgrade() {
+    if (this._wsUpgradeDone || this._intentionalClose) return;
+
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    // Try /ws path first (Railway/proxy friendly), fall back to root
-    const url = `${proto}://${location.host}/ws`;
-    console.log('[Transport] Trying WebSocket:', url);
+    // Try /ws path first, then root
+    const paths = ['/ws', '/'];
+    let pathIndex = 0;
 
-    let ws;
-    try {
-      ws = new WebSocket(url);
-    } catch(e) {
-      console.warn('[Transport] WebSocket constructor failed, trying root path:', e);
-      this._tryWebSocketRoot();
-      return;
-    }
-
-    let opened = false;
-
-    // 10s timeout — Railway cold starts need more time
-    const timeout = setTimeout(() => {
-      if (!opened) {
-        console.log('[Transport] WebSocket timeout on /ws, trying root path');
-        ws.close();
-        this._tryWebSocketRoot();
+    const tryNext = () => {
+      if (pathIndex >= paths.length) {
+        console.log('[Transport] WebSocket not available, staying on polling');
+        this._wsUpgradeDone = true; // Don't try again
+        return;
       }
-    }, 10000);
+      const url = `${proto}://${location.host}${paths[pathIndex]}`;
+      console.log('[Transport] Trying WebSocket upgrade:', url);
 
-    ws.onopen = () => {
-      opened = true;
-      clearTimeout(timeout);
-      console.log('[Transport] WebSocket connected on /ws');
-      this._ws = ws;
-      this._polling = false;
-      this._reconnectAttempts = 0;
-      this._reconnectDelay = 1000;
-      this.connected = true;
-      this._stopPolling();
-      this._startHeartbeat();
-      this.dispatchEvent(new Event('open'));
-      // Flush queued messages
-      for (const msg of this._queue) this._wsSend(msg);
-      this._queue = [];
-    };
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch(e) {
+        pathIndex++;
+        tryNext();
+        return;
+      }
 
-    ws.onmessage = (e) => {
-      let msg; try { msg = JSON.parse(e.data); } catch { return; }
-      if (msg.type === 'connected') return; // handshake ack
-      if (msg.type === 'pong') return; // heartbeat ack
-      this.dispatchEvent(new CustomEvent('message', { detail: msg }));
-    };
+      let opened = false;
 
-    ws.onclose = () => {
-      clearTimeout(timeout);
-      this._stopHeartbeat();
-      if (!opened) return; // already handled by timeout
-      this._ws = null;
-      this.connected = false;
-      this.dispatchEvent(new Event('close'));
-      if (!this._intentionalClose) {
-        // Try WebSocket first, then fallback to polling if repeated failures
-        this._reconnectAttempts++;
-        if (this._reconnectAttempts >= 3) {
-          console.log('[Transport] WebSocket failed 3+ times, falling back to polling');
-          this._startPolling();
-        } else {
-          const delay = Math.min(this._reconnectDelay * Math.pow(1.5, this._reconnectAttempts - 1), this._maxReconnectDelay);
-          console.log(`[Transport] Reconnecting WebSocket in ${Math.round(delay)}ms (attempt ${this._reconnectAttempts})`);
-          setTimeout(() => this._tryWebSocket(), delay);
+      // Short timeout — if WS doesn't connect in 3s, move on
+      const timeout = setTimeout(() => {
+        if (!opened) {
+          ws.close();
+          pathIndex++;
+          tryNext();
         }
-      }
-    };
+      }, 3000);
 
-    ws.onerror = (e) => {
-      console.warn('[Transport] WebSocket error:', e);
-      clearTimeout(timeout);
-    };
+      ws.onopen = () => {
+        opened = true;
+        clearTimeout(timeout);
+        console.log('[Transport] WebSocket upgrade successful on', paths[pathIndex]);
+        this._ws = ws;
+        this._polling = false; // Stop polling, use WS
+        this._stopPollLoop();
+        this._startHeartbeat();
+        this._wsUpgradeDone = true;
 
-    ws.onunexpected = () => {};
-  }
+        // Don't re-dispatch 'open' — we're already connected via polling
+        // Flush any queued messages via WS
+        for (const msg of this._queue) this._wsSend(msg);
+        this._queue = [];
+      };
 
-  // Fallback: try connecting to root path (for older deployments)
-  _tryWebSocketRoot() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}`;
-    console.log('[Transport] Trying WebSocket on root:', url);
-    const ws = new WebSocket(url);
-    let opened = false;
+      ws.onmessage = (e) => {
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === 'connected') return;
+        if (msg.type === 'pong') return;
+        this.dispatchEvent(new CustomEvent('message', { detail: msg }));
+      };
 
-    const timeout = setTimeout(() => {
-      if (!opened) {
-        console.log('[Transport] WebSocket timeout on root, falling back to polling');
-        ws.close();
-        this._startPolling();
-      }
-    }, 10000);
-
-    ws.onopen = () => {
-      opened = true;
-      clearTimeout(timeout);
-      console.log('[Transport] WebSocket connected on root');
-      this._ws = ws;
-      this._polling = false;
-      this._reconnectAttempts = 0;
-      this._reconnectDelay = 1000;
-      this.connected = true;
-      this._stopPolling();
-      this._startHeartbeat();
-      this.dispatchEvent(new Event('open'));
-      for (const msg of this._queue) this._wsSend(msg);
-      this._queue = [];
-    };
-
-    ws.onmessage = (e) => {
-      let msg; try { msg = JSON.parse(e.data); } catch { return; }
-      if (msg.type === 'connected' || msg.type === 'pong') return;
-      this.dispatchEvent(new CustomEvent('message', { detail: msg }));
-    };
-
-    ws.onclose = () => {
-      clearTimeout(timeout);
-      this._stopHeartbeat();
-      if (!opened) return;
-      this._ws = null;
-      this.connected = false;
-      this.dispatchEvent(new Event('close'));
-      if (!this._intentionalClose) {
-        this._reconnectAttempts++;
-        if (this._reconnectAttempts >= 3) {
+      ws.onclose = () => {
+        clearTimeout(timeout);
+        this._stopHeartbeat();
+        if (!opened) return; // handled by timeout
+        // WS was connected but dropped — fall back to polling
+        console.log('[Transport] WebSocket disconnected, falling back to polling');
+        this._ws = null;
+        if (!this._intentionalClose && !this._polling) {
           this._startPolling();
-        } else {
-          const delay = Math.min(this._reconnectDelay * Math.pow(1.5, this._reconnectAttempts - 1), this._maxReconnectDelay);
-          setTimeout(() => this._tryWebSocket(), delay);
         }
-      }
+      };
+
+      ws.onerror = () => {
+        clearTimeout(timeout);
+      };
     };
 
-    ws.onerror = () => { clearTimeout(timeout); };
+    tryNext();
   }
 
   // ── Heartbeat ──────────────────────────────────────────
@@ -178,14 +128,13 @@ class SignalingClient extends EventTarget {
     }
   }
 
-  // ── Polling ────────────────────────────────────────────
-  _stopPolling() {
+  // ── Polling (PRIMARY transport) ────────────────────────
+  _stopPollLoop() {
     this._pollActive = false;
   }
 
   async _startPolling() {
     if (this._polling) return;
-    console.log('[Transport] Falling back to HTTP polling');
     this._polling = true;
     this._ws = null;
 
@@ -196,6 +145,7 @@ class SignalingClient extends EventTarget {
       this._clientId = clientId;
       this.connected = true;
       this._pollActive = true;
+      this._reconnectAttempts = 0;
       this.dispatchEvent(new Event('open'));
       this._pollLoop();
 
@@ -205,8 +155,9 @@ class SignalingClient extends EventTarget {
     } catch(e) {
       console.error('[Transport] Polling setup failed:', e);
       this._polling = false;
-      const delay = Math.min(2000 * (this._reconnectAttempts + 1), 10000);
-      setTimeout(() => { this._reconnectAttempts++; this._startPolling(); }, delay);
+      this._reconnectAttempts++;
+      const delay = Math.min(1000 * this._reconnectAttempts, 5000);
+      setTimeout(() => this._startPolling(), delay);
     }
   }
 
@@ -223,10 +174,6 @@ class SignalingClient extends EventTarget {
       } catch(e) {
         if (!this._intentionalClose) await new Promise(r => setTimeout(r, 1500));
       }
-    }
-    // If polling stopped but not intentional, try to reconnect via WebSocket
-    if (!this._intentionalClose && !this._pollActive) {
-      setTimeout(() => this._tryWebSocket(), 2000);
     }
   }
 
@@ -262,7 +209,7 @@ class SignalingClient extends EventTarget {
   close() {
     this._intentionalClose = true;
     this._stopHeartbeat();
-    this._stopPolling();
+    this._stopPollLoop();
     if (this._ws) this._ws.close();
   }
 }

@@ -28,7 +28,7 @@ class SignalingClient extends EventTarget {
 
     const timeout = setTimeout(() => {
       if (!opened) { ws.close(); this._startPolling(); }
-    }, 4000);
+    }, 1500);
 
     ws.onopen = () => {
       opened = true;
